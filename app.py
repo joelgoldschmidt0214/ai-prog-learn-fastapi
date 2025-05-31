@@ -45,14 +45,15 @@ class Reference(BaseModel):
 class GeminiStructuredResponse(BaseModel):
     explanation: str = Field(description="主要な解説文。マークダウン形式を期待。")
     quiz: Optional[Quiz] = Field(
-        description="目的が「プログラミング学習」の場合に生成されるクイズ"
-    )
+        None, description="目的が「プログラミング学習」の場合に生成されるクイズ"
+    )  # デフォルトをNoneに
     references: Optional[List[Reference]] = Field(
-        description="目的が「困りごとの解決」の場合に生成される参考文献リスト"
-    )
+        None, description="目的が「困りごとの解決」の場合に生成される参考文献リスト"
+    )  # デフォルトをNoneに
     raw_gemini_text: Optional[str] = Field(
-        description="JSONパースに失敗した場合のGeminiからの生テキスト（デバッグ用）"
-    )
+        None,
+        description="JSONパースに失敗した場合のGeminiからの生テキスト（デバッグ用）",
+    )  # OptionalかつデフォルトをNoneに
 
 
 class QuizEvaluationRequest(BaseModel):
@@ -279,31 +280,50 @@ def parse_gemini_json_response(
     target_model_cls: Type[GeminiStructuredResponse],  # 変数名を変更 (前回提案通り)
 ) -> GeminiStructuredResponse:
     raw_text_for_fallback = json_string
+    logger.info(
+        f"Geminiからの生の応答 (パース前): {raw_text_for_fallback}"
+    )  # ★生の応答をログに出力
+
     try:
         match = re.search(r"```json\s*([\s\S]+?)\s*```", json_string, re.DOTALL)
         if match:
-            json_string = match.group(1).strip()
+            cleaned_json_string = match.group(1).strip()
         else:
             first_brace = json_string.find("{")
             last_brace = json_string.rfind("}")
             if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-                json_string = json_string[first_brace : last_brace + 1]
+                cleaned_json_string = json_string[first_brace : last_brace + 1]
+            else:
+                # JSONらしき構造が見つからない場合
+                logger.error(
+                    f"JSON構造が見つかりませんでした。元のテキスト: {raw_text_for_fallback[:500]}..."
+                )
+                return GeminiStructuredResponse(
+                    explanation=f"エラー: Geminiからの応答を期待した形式で解析できませんでした。\n以下はモデルからの生の応答です:\n\n{raw_text_for_fallback}",
+                    raw_gemini_text=raw_text_for_fallback,
+                    quiz=None,  # フォールバック時はNoneを明示
+                    references=None,  # フォールバック時はNoneを明示
+                )
 
-        parsed_data = json.loads(json_string)
+        parsed_data = json.loads(cleaned_json_string)
+        logger.info(
+            f"JSONパース成功後のデータ: {parsed_data}"
+        )  # ★パース後の辞書をログに出力
         return target_model_cls(**parsed_data)
     except json.JSONDecodeError as e_json:
         logger.error(
-            f"JSONデコードエラー: {e_json}. 元のテキスト抜粋: {raw_text_for_fallback[:300]}..."
+            f"JSONデコードエラー: {e_json}. クリーンアップ試行テキスト: {cleaned_json_string[:500] if 'cleaned_json_string' in locals() else 'N/A'}... 元のテキスト抜粋: {raw_text_for_fallback[:300]}..."
         )
     except Exception as e_pydantic:  # 主にPydanticのバリデーションエラー
         logger.error(
-            f"Pydanticモデルへのパースエラー: {e_pydantic}. 元のテキスト抜粋: {raw_text_for_fallback[:300]}..."
+            f"Pydanticモデルへのパース/バリデーションエラー: {e_pydantic}. パース試行データ: {parsed_data if 'parsed_data' in locals() else 'N/A'}. 元のテキスト抜粋: {raw_text_for_fallback[:300]}..."
         )
 
-    # フォールバック時のインスタンス化で quiz と references を明示 (Pylance対策)
     return GeminiStructuredResponse(
         explanation=f"エラー: Geminiからの応答を期待した形式で解析できませんでした。\n以下はモデルからの生の応答です:\n\n{raw_text_for_fallback}",
         raw_gemini_text=raw_text_for_fallback,
+        quiz=None,
+        references=None,
     )
 
 
