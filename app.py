@@ -85,8 +85,8 @@ PROMPTS_DIR = "prompts"
 
 # メインのコンテンツ生成用プロンプトファイル名
 MAIN_PROMPT_FILENAMES: Tuple[str, ...] = (
-    "01_persona_prompt.md",
-    "02_interaction_rules_prompt.md",
+    "01_persona_prompt_rev1.md",
+    "02_interaction_rules_prompt_rev1.md",
     "03_json_output_format_prompt.md",
 )
 
