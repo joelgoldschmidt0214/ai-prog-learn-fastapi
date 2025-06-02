@@ -91,7 +91,7 @@ GEMINI_MODEL_FOR_QUIZ: Dict = {
     "max_output": 8000,
 }
 PROMPTS_DIR = "prompts"
-SOLUTION_PROMPT_FILENAMES: Tuple[str, ...] = (
+QUIZ_PROMPT_FILENAMES: Tuple[str, ...] = (
     "01_persona_prompt_rev2.md",
     "02_interaction_rules_prompt_rev1.md",
     "03_json_output_format_prompt_rev1.md",
@@ -527,7 +527,8 @@ async def generate_content_with_gemini(
             )
     # --- Groundingツールの準備 ---
     use_grounding = selected_goal == "困りごとの解決"  # Groundingを使う条件
-    tools_list_for_api = [Tool(google_search=GoogleSearch())] if use_grounding else None
+    # tools_list_for_api = [Tool(google_search=GoogleSearch())] if use_grounding else None
+    tools_list_for_api = None  # 一時的に無効化
 
     # システムプロンプトファイルの読み込み
     if use_grounding:
@@ -539,9 +540,9 @@ async def generate_content_with_gemini(
         logger.info("Grounding (Google Search) ツールを有効化します。")
     else:
         system_instruction_text = load_prompt_files(
-            SOLUTION_PROMPT_FILENAMES,
+            prompt_filenames=QUIZ_PROMPT_FILENAMES,
             add_dynamic_info=True,
-            model_dict=GEMINI_MODEL_FOR_SOLUTION,
+            model_dict=GEMINI_MODEL_FOR_QUIZ,
         )
     if system_instruction_text.startswith("エラー:"):
         raise HTTPException(status_code=500, detail="SYSTEM_PROMPT_LOAD_ERROR")
@@ -605,7 +606,8 @@ async def generate_content_with_gemini(
         logger.info(
             f"Gemini API ({model_name}) へ非同期リクエストを開始します (google-genai SDK)..."
         )
-        gemini_api_response = await client.aio.models.generate_content(  # client.aio.models を使用
+        # gemini_api_response = await client.aio.models.generate_content(  # client.aio.models を使用
+        gemini_api_response = client.models.generate_content(  # client.models を使用
             model=f"models/{model_name}",  # "models/" プレフィックス
             contents=api_contents_list,  # ★ ここにテキストとファイルパートのリストが入る
             config=generation_config_obj,  # GenerateContentConfigオブジェクトを渡す
@@ -774,7 +776,9 @@ async def evaluate_quiz_answer(request_data: QuizEvaluationRequest, request: Req
         raise HTTPException(status_code=503, detail="GEMINI_UNAVAILABLE_FOR_EVALUATION")
 
     evaluation_system_instruction_text = load_prompt_files(
-        EVALUATION_PROMPT_FILENAME, add_dynamic_info=True
+        prompt_filenames=EVALUATION_PROMPT_FILENAME,
+        add_dynamic_info=True,
+        model_dict=GEMINI_MODEL_FOR_QUIZ,
     )
     if evaluation_system_instruction_text.startswith("エラー:"):
         raise HTTPException(status_code=500, detail="EVALUATION_PROMPT_LOAD_ERROR")
@@ -811,7 +815,8 @@ async def evaluate_quiz_answer(request_data: QuizEvaluationRequest, request: Req
         logger.info(
             f"Gemini ({GEMINI_MODEL_FOR_QUIZ['model']}) へクイズ採点リクエストを開始します..."
         )
-        evaluation_response = await client.aio.models.generate_content(
+        # evaluation_response = await client.aio.models.generate_content(
+        evaluation_response = client.models.generate_content(
             model=f"models/{GEMINI_MODEL_FOR_QUIZ['model']}",
             contents=[user_query_for_evaluation],
             config=evaluation_generation_config,  # オブジェクトで渡す
