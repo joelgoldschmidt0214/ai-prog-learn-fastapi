@@ -1,4 +1,4 @@
-# app.py
+# app.py (google-genai SDK 完全準拠版)
 from fastapi import (
     FastAPI,
     UploadFile,
@@ -9,14 +9,32 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Optional, Type  # Typeをインポート
-import google.generativeai as genai
+from typing import List, Optional, Type, Tuple
 
-# from google.generativeai.types import (  # ★ 例外クラスも直接インポートするか、types. でアクセス
-#     GenerationConfig,
-#     BlockedPromptException,
-#     StopCandidateException,
+# === google-genai SDK のインポート ===
+from google import genai
+from google.genai import errors as genai_errors, types  # ★ SDK固有のエラー
+import google.api_core.exceptions  # Google Cloud共通のAPIエラー
+
+# === 型定義のインポート ===
+# google.genai.types から取得 (PyPIのSafety Settings, Typesセクション参考)
+from google.genai.types import (
+    GenerateContentConfig,
+    SafetySetting,
+    HarmCategory,
+    HarmBlockThreshold,
+    BlockedReason,
+    FinishReason,
+    GoogleSearch,
+    Tool,
+    Part,
+    Content,
+    # Content, Part, Tool は google.ai.generativelanguage から取得するのがより適切
+)
+# from google.ai.generativelanguage import (
+#     Content,  # PyPIのTypesセクションの例より
 # )
+
 import os
 import json
 import re
@@ -24,15 +42,13 @@ from dotenv import load_dotenv
 import logging
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime  # datetimeをインポート
-from typing import Tuple  # Tupleをインポート
+from datetime import datetime
 
-# ロギング設定
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# --- Pydanticモデル定義 ---
+# --- Pydanticモデル定義 (変更なし) ---
 class Quiz(BaseModel):
     question: str = Field(description="クイズの質問文")
 
@@ -46,112 +62,84 @@ class GeminiStructuredResponse(BaseModel):
     explanation: str = Field(description="主要な解説文。マークダウン形式を期待。")
     quiz: Optional[Quiz] = Field(
         None, description="目的が「プログラミング学習」の場合に生成されるクイズ"
-    )  # デフォルトをNoneに
+    )
     references: Optional[List[Reference]] = Field(
         None, description="目的が「困りごとの解決」の場合に生成される参考文献リスト"
-    )  # デフォルトをNoneに
+    )
     raw_gemini_text: Optional[str] = Field(
         None,
-        description="JSONパースに失敗した場合のGeminiからの生テキスト（デバッグ用）",
-    )  # OptionalかつデフォルトをNoneに
+        description="JSONパースに失敗した場合やresponse.parsedが利用できない場合のGeminiからの生テキスト",
+    )
 
 
 class QuizEvaluationRequest(BaseModel):
     original_explanation: str
     quiz_question: str
     user_answer: str
-    # selected_language: Optional[str] = None # 必要に応じてコンテキスト情報
 
 
 class QuizEvaluationResponse(BaseModel):
-    evaluation_comment: str  # Geminiからの採点コメント (Markdown形式を期待)
-    # is_correct: Optional[bool] = None # より厳密な正誤判定が必要な場合
+    evaluation_comment: str
 
 
-# データのスキーマを定義するためのクラス (FastAPIのサンプル用)
-class EchoMessage(BaseModel):
-    message: str | None = None
-
-
-# --- アプリケーション全体の設定変数 ---
-GEMINI_MODEL_NAME = "gemini-2.0-flash"  # ★モデル名をここに集約 (2025年5月時点で利用可能な実際のモデル名に置き換えてください)
-# 'gemini-2.5-flash-preview-05-20'
-GEMINI_KNOWLEDGE_CUTOFF = (
-    "2024-08"  # ★モデルの知識カットオフをここに集約 (実際のカットオフに)
-)
-
-# --- プロンプトファイル設定 ---
+# --- アプリケーション全体の設定変数 (変更なし) ---
+GEMINI_MODEL_NAME = "gemini-2.0-flash"
+GEMINI_KNOWLEDGE_CUTOFF = "2024-08"  # モデルにより異なる
 PROMPTS_DIR = "prompts"
-
-# メインのコンテンツ生成用プロンプトファイル名
 MAIN_PROMPT_FILENAMES: Tuple[str, ...] = (
-    "01_persona_prompt_rev1.md",
+    "01_persona_prompt_rev2.md",
     "02_interaction_rules_prompt_rev1.md",
     "03_json_output_format_prompt.md",
 )
-
-# クイズ採点用プロンプトファイル名 (タプル型で定義)
-EVALUATION_PROMPT_FILENAME: Tuple[str, ...] = (
-    "quiz_evaluation_prompt.md",
-)  # ファイルが1つでもタプルにする
+EVALUATION_PROMPT_FILENAME: Tuple[str, ...] = ("quiz_evaluation_prompt.md",)
 
 
-# --- Gemini API 初期化関連 ---
+# --- Gemini API 初期化関連 (変更なし) ---
 async def initialize_gemini_model(app_instance: FastAPI):
-    logger.info("Gemini APIの初期化処理を開始します...")
+    logger.info("Gemini APIの初期化処理を開始します (google-genai SDK)...")
     try:
         load_dotenv()
         google_api_key = os.getenv("GOOGLE_API_KEY")
         if not google_api_key:
             logger.error("環境変数 GOOGLE_API_KEY が設定されていません。")
             app_instance.state.is_gemini_initialized = False
-            app_instance.state.gemini_model = None
+            app_instance.state.gemini_client = None
             return
-
-        genai.configure(api_key=google_api_key)
-        # model_name = 'gemini-2.5-flash-preview-05-20' # ← GEMINI_MODEL_NAME を使用
-
-        app_instance.state.gemini_model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+        app_instance.state.gemini_client = genai.Client(api_key=google_api_key)
         app_instance.state.is_gemini_initialized = True
         logger.info(
-            f"Gemini APIの初期化が正常に完了しました。モデル: {GEMINI_MODEL_NAME}"
+            "Gemini API Client (google-genai SDK) の初期化が正常に完了しました。"
         )
     except Exception as e:
         logger.error(
             f"Gemini APIの初期化中に重大なエラーが発生しました: {e}", exc_info=True
         )
         app_instance.state.is_gemini_initialized = False
-        app_instance.state.gemini_model = None
+        app_instance.state.gemini_client = None
     finally:
         if hasattr(app_instance.state, "gemini_init_task"):
             app_instance.state.gemini_init_task = None
 
 
-# --- Lifespanイベントハンドラ ---
+# --- Lifespanイベントハンドラ (変更なし) ---
 @asynccontextmanager
-async def lifespan(app_instance: FastAPI):
+async def lifespan(app: FastAPI):
+    # ... (省略、前回と同じ) ...
     logger.info("FastAPIアプリケーション起動シーケンス開始 (lifespan)...")
-    app_instance.state.gemini_model = None
-    app_instance.state.is_gemini_initialized = False
-    app_instance.state.gemini_init_task = asyncio.create_task(
-        initialize_gemini_model(app_instance)
-    )
+    app.state.gemini_client = None
+    app.state.is_gemini_initialized = False
+    app.state.gemini_init_task = asyncio.create_task(initialize_gemini_model(app))
     logger.info(
         "Gemini初期化タスクをバックグラウンドでスケジュールしました (lifespan)。"
     )
-
     yield
-
     logger.info("FastAPIアプリケーションシャットダウンシーケンス開始 (lifespan)...")
-    if (
-        hasattr(app_instance.state, "gemini_init_task")
-        and app_instance.state.gemini_init_task
-    ):
-        if not app_instance.state.gemini_init_task.done():
+    if hasattr(app.state, "gemini_init_task") and app.state.gemini_init_task:
+        if not app.state.gemini_init_task.done():
             logger.info("実行中のGemini初期化タスクをキャンセルしようとしています...")
-            app_instance.state.gemini_init_task.cancel()
+            app.state.gemini_init_task.cancel()
             try:
-                await app_instance.state.gemini_init_task
+                await app.state.gemini_init_task
             except asyncio.CancelledError:
                 logger.info("Gemini初期化タスクは正常にキャンセルされました。")
             except Exception as e:
@@ -160,10 +148,8 @@ async def lifespan(app_instance: FastAPI):
             logger.info("Gemini初期化タスクは既に完了していました。")
 
 
-# FastAPIアプリケーションインスタンスの作成
 app = FastAPI(lifespan=lifespan)
-
-# CORSの設定
+# ... (CORS, root_hello, load_prompt_files, get_gemini_status は変更なし) ...
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -173,157 +159,111 @@ app.add_middleware(
 )
 
 
-# --- FastAPIサンプルエンドポイント ---
 @app.get("/")
 def root_hello():
     return {"status": "ok", "message": "FastAPI backend is operational."}
 
 
-# @app.get("/api/hello")
-# def hello_world():
-#     return {"greeting": "Hello! はせちゅー"}
-
-
-# @app.get("/api/multiply/{id}")
-# def multiply(id: float):
-#     doubled_value = id * 2
-#     return {"input_value": id, "doubled_value": doubled_value}
-
-
-# @app.get("/api/half/{id}")
-# def devided(id: float):  # 関数名: divide の方が一般的
-#     halfed_value = id / 2
-#     return {"input_value": id, "halfed_value": halfed_value}
-
-
-# @app.get("/api/count/{id}")
-# def count(id: str):
-#     count_value = len(id)
-#     return {"input_string": id, "count_value": count_value}
-
-
-# @app.post("/api/echo")
-# def echo(message: EchoMessage):
-#     echo_message_content = (
-#         message.message if message.message else "No message provided by client"
-#     )
-#     return {"echoed_content": echo_message_content}
-
-
-# --- プロンプト読み込み関数 (汎用化) ---
 def load_prompt_files(
     prompt_filenames: Tuple[str, ...], add_dynamic_info: bool = True
 ) -> str:
-    """
-    指定されたプロンプトファイルを読み込み、結合する。
-    オプションで冒頭に動的な情報（現在日付、モデル情報）を挿入する。
-    """
     prompt_parts = []
-
     if add_dynamic_info:
         current_date_str = datetime.now().strftime("%Y年%m月%d日")
-        prompt_parts.append("# システム基本情報")
-        prompt_parts.append(f"- 現在の日付: {current_date_str}")
-        prompt_parts.append(f"- 利用AIモデル: {GEMINI_MODEL_NAME}")
-        prompt_parts.append(f"- AI知識カットオフ: {GEMINI_KNOWLEDGE_CUTOFF}\n")
-
+        prompt_parts.append(
+            f"# システム基本情報\n- 現在の日付: {current_date_str}\n- 利用AIモデル: {GEMINI_MODEL_NAME}\n- AI知識カットオフ: {GEMINI_KNOWLEDGE_CUTOFF}\n"
+        )
     for filename in prompt_filenames:
         filepath = os.path.join(PROMPTS_DIR, filename)
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 prompt_parts.append(f.read())
-                # プロンプトファイルが複数ある場合のみ区切り線を追加
                 if len(prompt_filenames) > 1 and filename != prompt_filenames[-1]:
-                    prompt_parts.append("\n---\n")  # プロンプト間の区切り
+                    prompt_parts.append("\n---\n")
             logger.info(f"プロンプトファイル '{filepath}' を読み込みました。")
         except FileNotFoundError:
             logger.error(f"プロンプトファイルが見つかりません: {filepath}")
-            # ここでエラー処理を行うか、デフォルトプロンプトを使用するか検討
-            # この関数からは空文字列を返すか例外を投げるなど、呼び出し元で処理が必要
             return f"エラー: プロンプトファイル {filepath} が見つかりません。"
         except Exception as e:
             logger.error(f"プロンプトファイル '{filepath}' の読み込み中にエラー: {e}")
             return f"エラー: プロンプトファイル {filepath} の読み込み中にエラーが発生しました。"
-
     return "\n".join(prompt_parts)
 
 
-# --- Gemini関連APIエンドポイント ---
 @app.get("/api/gemini/status")
 async def get_gemini_status(request: Request):
-    app_instance = request.app
-    is_initializing = False
-    if (
-        hasattr(app_instance.state, "gemini_init_task")
-        and app_instance.state.gemini_init_task
-        and not app_instance.state.gemini_init_task.done()
-    ):
-        is_initializing = True
-    initialized = (
-        hasattr(app_instance.state, "is_gemini_initialized")
-        and app_instance.state.is_gemini_initialized
+    app_state = request.app.state
+
+    is_initializing = False  # デフォルトはFalse
+    if hasattr(app_state, "gemini_init_task") and app_state.gemini_init_task:
+        if not app_state.gemini_init_task.done():
+            is_initializing = True
+
+    # initialized は initialize_gemini_model 関数内で True に設定される
+    initialized_flag = (
+        hasattr(app_state, "is_gemini_initialized") and app_state.is_gemini_initialized
     )
-    model_ready = (
-        hasattr(app_instance.state, "gemini_model")
-        and app_instance.state.gemini_model is not None
+
+    # client_ready は client オブジェクトが実際に設定されたか
+    client_is_ready = (
+        hasattr(app_state, "gemini_client") and app_state.gemini_client is not None
+    )
+
+    # 最終的な準備完了状態は、タスクが完了し、かつ初期化フラグとクライアントが準備OKであること
+    # ただし、タスクが完了すれば initialized_flag と client_is_ready も True になっているはず
+    fully_ready = initialized_flag and client_is_ready and not is_initializing
+
+    logger.info(
+        f"Status check: is_initializing={is_initializing}, initialized_flag={initialized_flag}, client_is_ready={client_is_ready}, fully_ready={fully_ready}"
     )
 
     return {
-        "initialized": initialized,
-        "model_ready": model_ready,
-        "is_initializing": is_initializing,
+        "initialized": initialized_flag,  # initialize_gemini_model の最後に True になる
+        "client_ready": client_is_ready,  # client オブジェクトが設定されたか
+        "is_initializing": is_initializing,  # バックグラウンドタスクがまだ実行中か
+        "fully_ready_for_requests": fully_ready,  # これをフロントエンドで使うとより明確かも
     }
 
 
+# parse_gemini_json_response は、response.parsed が利用できない場合のフォールバックとして残す
 def parse_gemini_json_response(
-    json_string: str,
-    target_model_cls: Type[GeminiStructuredResponse],  # 変数名を変更 (前回提案通り)
+    json_string: str, target_model_cls: Type[GeminiStructuredResponse]
 ) -> GeminiStructuredResponse:
+    # ... (内容は変更なし、前回と同じ) ...
     raw_text_for_fallback = json_string
-    logger.info(
-        f"Geminiからの生の応答 (パース前): {raw_text_for_fallback}"
-    )  # ★生の応答をログに出力
-
+    logger.info(f"Geminiからの生の応答 (パース前): {raw_text_for_fallback}")
     try:
         match = re.search(r"```json\s*([\s\S]+?)\s*```", json_string, re.DOTALL)
-        if match:
-            cleaned_json_string = match.group(1).strip()
-        else:
-            first_brace = json_string.find("{")
-            last_brace = json_string.rfind("}")
-            if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-                cleaned_json_string = json_string[first_brace : last_brace + 1]
-            else:
-                # JSONらしき構造が見つからない場合
-                logger.error(
-                    f"JSON構造が見つかりませんでした。元のテキスト: {raw_text_for_fallback[:500]}..."
-                )
-                return GeminiStructuredResponse(
-                    explanation=f"エラー: Geminiからの応答を期待した形式で解析できませんでした。\n以下はモデルからの生の応答です:\n\n{raw_text_for_fallback}",
-                    raw_gemini_text=raw_text_for_fallback,
-                    quiz=None,  # フォールバック時はNoneを明示
-                    references=None,  # フォールバック時はNoneを明示
-                )
-
+        cleaned_json_string = match.group(1).strip() if match else json_string
+        first_brace = cleaned_json_string.find("{")
+        last_brace = cleaned_json_string.rfind("}")
+        if not (
+            match
+            or (first_brace != -1 and last_brace != -1 and last_brace > first_brace)
+        ):
+            logger.error(
+                f"JSON構造が見つかりませんでした。元のテキスト: {raw_text_for_fallback[:500]}..."
+            )
+            return GeminiStructuredResponse(
+                explanation=f"エラー: Geminiからの応答を期待した形式で解析できませんでした。\n以下はモデルからの生の応答です:\n\n{raw_text_for_fallback}",
+                raw_gemini_text=raw_text_for_fallback,
+            )
+        if not match:
+            cleaned_json_string = cleaned_json_string[first_brace : last_brace + 1]
         parsed_data = json.loads(cleaned_json_string)
-        logger.info(
-            f"JSONパース成功後のデータ: {parsed_data}"
-        )  # ★パース後の辞書をログに出力
+        logger.info(f"JSONパース成功後のデータ: {parsed_data}")
         return target_model_cls(**parsed_data)
     except json.JSONDecodeError as e_json:
         logger.error(
-            f"JSONデコードエラー: {e_json}. クリーンアップ試行テキスト: {cleaned_json_string[:500] if 'cleaned_json_string' in locals() else 'N/A'}... 元のテキスト抜粋: {raw_text_for_fallback[:300]}..."
+            f"JSONデコードエラー: {e_json}. 試行テキスト抜粋: {cleaned_json_string[:300] if 'cleaned_json_string' in locals() else raw_text_for_fallback[:300]}..."
         )
-    except Exception as e_pydantic:  # 主にPydanticのバリデーションエラー
+    except Exception as e_pydantic:
         logger.error(
             f"Pydanticモデルへのパース/バリデーションエラー: {e_pydantic}. パース試行データ: {parsed_data if 'parsed_data' in locals() else 'N/A'}. 元のテキスト抜粋: {raw_text_for_fallback[:300]}..."
         )
-
     return GeminiStructuredResponse(
         explanation=f"エラー: Geminiからの応答を期待した形式で解析できませんでした。\n以下はモデルからの生の応答です:\n\n{raw_text_for_fallback}",
         raw_gemini_text=raw_text_for_fallback,
-        quiz=None,
-        references=None,
     )
 
 
@@ -336,281 +276,758 @@ async def generate_content_with_gemini(
     problem_details: str = Form(""),
     file: Optional[UploadFile] = File(None),
 ):
-    app_instance = request.app
-    if not (
-        hasattr(app_instance.state, "is_gemini_initialized")
-        and app_instance.state.is_gemini_initialized
-        and hasattr(app_instance.state, "gemini_model")
-        and app_instance.state.gemini_model is not None
-    ):
+    client: genai.Client = request.app.state.gemini_client
+    if not client or not request.app.state.is_gemini_initialized:
+        # ... (初期化チェック)
         if (
-            hasattr(app_instance.state, "gemini_init_task")
-            and app_instance.state.gemini_init_task
-            and not app_instance.state.gemini_init_task.done()
+            hasattr(request.app.state, "gemini_init_task")
+            and request.app.state.gemini_init_task
+            and not request.app.state.gemini_init_task.done()
         ):
             raise HTTPException(status_code=503, detail="GEMINI_INITIALIZING")
         raise HTTPException(status_code=503, detail="GEMINI_UNAVAILABLE")
 
-    gemini_model = app_instance.state.gemini_model
-
-    file_content_for_prompt: str = ""
-    file_info_for_prompt: str = ""
-    # (ファイル処理ロジック ... )
-    if file:
-        file_name = file.filename
-        file_info_for_prompt = f"ユーザーがアップロードしたファイル名: {file_name}\n"
-        file_bytes = await file.read()
-        try:
-            if file_name.endswith(".ipynb"):  # type: ignore
-                file_info_for_prompt += "ファイル種類: Jupyter Notebook\n"
-                notebook_content_str = file_bytes.decode("utf-8")
-                notebook_json = json.loads(notebook_content_str)
-                code_cells_content = [
-                    "".join(cell.get("source", []))
-                    for cell in notebook_json.get("cells", [])
-                    if cell.get("cell_type") == "code"
-                ]
-                file_content_for_prompt = "\n\n# --- ipynbセル区切り ---\n\n".join(
-                    code_cells_content
-                )
-                file_info_for_prompt += "処理: コードセルを抽出しました。\n"
-            else:
-                file_info_for_prompt += "ファイル種類: テキストファイル\n"
-                try:
-                    file_content_for_prompt = file_bytes.decode("utf-8")
-                    file_info_for_prompt += (
-                        "エンコーディング: UTF-8で読み込みました。\n"
-                    )
-                except UnicodeDecodeError:
-                    try:
-                        file_content_for_prompt = file_bytes.decode("shift-jis")
-                        file_info_for_prompt += (
-                            "エンコーディング: Shift-JISで読み込みました。\n"
-                        )
-                    except UnicodeDecodeError:
-                        file_info_for_prompt += (
-                            "エンコーディング: UTF-8, Shift-JISでのデコードに失敗。\n"
-                        )
-                        file_content_for_prompt = ""
-        except Exception as e_file:
-            logger.error(
-                f"ファイル処理中にエラー ({file_name}): {e_file}", exc_info=True
-            )
-            file_info_for_prompt += (
-                f"処理エラー: {e_file}\nファイル内容は利用できません。\n"
-            )
-            file_content_for_prompt = ""
-        if file_content_for_prompt:
-            max_chars = 30000
-            if len(file_content_for_prompt) > max_chars:
-                file_content_for_prompt = file_content_for_prompt[:max_chars]
-                file_info_for_prompt += f"注意: ファイル内容が長いため、先頭{max_chars}文字のみ利用します。\n"
-            file_info_for_prompt += f"利用文字数: {len(file_content_for_prompt)}\n"
-
-    # --- プロンプト生成 ---
-    # メインのシステムプロンプトを読み込む (動的情報あり)
-    system_base_prompt = load_prompt_files(MAIN_PROMPT_FILENAMES, add_dynamic_info=True)
-    if system_base_prompt.startswith(
-        "エラー:"
-    ):  # 読み込み失敗時の簡易エラーハンドリング
+    # --- プロンプトとコンテンツパートの準備 ---
+    system_instruction_text = load_prompt_files(
+        MAIN_PROMPT_FILENAMES, add_dynamic_info=True
+    )
+    if system_instruction_text.startswith("エラー:"):
         raise HTTPException(status_code=500, detail="SYSTEM_PROMPT_LOAD_ERROR")
-
-    user_specific_prompt_parts = [
-        "\n# ユーザーの状況:",
-        f"- 学習/利用言語: {selected_language}",
-        f"- 現在の目的: {selected_goal}",
-        f"- 技術レベル: {selected_level}",
+    user_text_prompt_parts = [
+        f"\n# ユーザーの状況:\n- 学習/利用言語: {selected_language}\n- 現在の目的: {selected_goal}\n- 技術レベル: {selected_level}"
     ]
     if problem_details.strip():
-        user_specific_prompt_parts.append(
+        user_text_prompt_parts.append(
             f"\n# ユーザーからの質問や困りごと:\n{problem_details.strip()}"
         )
     else:
-        default_prompt_text = ""
-        if selected_goal == "困りごとの解決":
-            default_prompt_text = f"{selected_language}に関する一般的な問題解決のヒントや、基本的なデバッグ方法について解説してください。"
-        elif selected_goal == "プログラミング学習":
-            default_prompt_text = f"{selected_language}の基本的な概念や、{selected_level}の方が次に学ぶと良いトピックについて、具体的な学習ステップとともに解説してください。"
-        user_specific_prompt_parts.append(
-            f"\n# ユーザーからの具体的な質問:\n（具体的な質問はありませんでした。{default_prompt_text}）"
+        # ユーザーからの入力が全くない場合は、エラーにするかデフォルトの指示を与える
+        if not file:  # ファイルもなく、テキストもない場合
+            logger.warning("ユーザーからの入力（テキストまたはファイル）がありません。")
+            raise HTTPException(
+                status_code=400, detail="質問内容またはファイルを入力してください。"
+            )
+        # ファイルはあるがテキストプロンプトがない場合は、ファイル処理の指示を促すようなテキストを生成
+        user_text_prompt_parts.append(
+            "\n# ユーザーからの具体的な質問:\n（添付ファイルを解析し、関連する情報を提供してください。）"
         )
 
-    if file_info_for_prompt:
-        user_specific_prompt_parts.append(
-            f"\n# ユーザーが提供したファイルに関する情報:\n{file_info_for_prompt.strip()}"
+    # file_content_for_prompt, file_info_for_prompt = "", ""
+    api_contents_list = [
+        Part(text="\n".join(user_text_prompt_parts))
+    ]  # 少なくともテキストパートは存在
+
+    # --- ファイル処理 (Jupyter Notebook対応と文字コード考慮) ---
+    if file:
+        file_name = file.filename or "uploaded_file"
+        file_bytes = await file.read()
+        mime_type = file.content_type or "application/octet-stream"
+        logger.info(
+            f"アップロードファイル '{file_name}' (MIME: {mime_type}, サイズ: {len(file_bytes)} bytes) を処理中..."
         )
-        if file_content_for_prompt.strip():
-            user_specific_prompt_parts.append(
-                f"\n# 提供されたファイルの内容 (抜粋または全文):\n```\n{file_content_for_prompt.strip()}\n```"
+
+        file_part_to_add = None
+        file_description_for_prompt = f"\n# 添付ファイル情報:\n- ファイル名: {file_name}\n- MIMEタイプ: {mime_type}\n"
+
+        if file_name.lower().endswith(".ipynb"):  # .ipynb ファイルの場合
+            file_description_for_prompt += "種別: Jupyter Notebook\n"
+            try:
+                notebook_content_str = file_bytes.decode("utf-8")  # Notebookは通常UTF-8
+                notebook_json = json.loads(notebook_content_str)
+                code_cells = [
+                    "".join(cell.get("source", []))
+                    for cell in notebook_json.get("cells", [])
+                    if cell.get("cell_type") == "code"
+                    and cell.get("source")  # sourceが存在することも確認
+                ]
+                if code_cells:
+                    extracted_code = "\n\n# --- コードセル区切り ---\n\n".join(
+                        code_cells
+                    )
+                    max_chars = 30000  # プロンプトに含める最大文字数
+                    if len(extracted_code) > max_chars:
+                        extracted_code = extracted_code[:max_chars]
+                        file_description_for_prompt += f"注意: 抽出したコード内容が長いため、先頭{max_chars}文字のみ利用します。\n"
+
+                    # Jupyter Notebook のコードセルをテキストとして Part に含める
+                    # mime_type は text/plain として扱うか、あるいは application/x-python などにするか検討
+                    # ここでは抽出したコードをプレーンテキストとして扱う
+                    file_part_to_add = Part.from_bytes(
+                        data=extracted_code.encode("utf-8"),
+                        mime_type="text/plain; charset=utf-8",
+                    )
+                    logger.info(
+                        f"Jupyter Notebook '{file_name}' からコードセルを抽出してPartに追加しました。"
+                    )
+                    # プロンプトにファイル情報（抽出した旨）を追加
+                    api_contents_list.append(
+                        Part(
+                            text=file_description_for_prompt
+                            + "抽出されたコードセルを考慮して回答してください。"
+                        )
+                    )
+
+                else:
+                    logger.info(
+                        f"Jupyter Notebook '{file_name}' にコードセルが見つかりませんでした。"
+                    )
+                    api_contents_list.append(
+                        Part(
+                            text=file_description_for_prompt
+                            + "このNotebookには実行可能なコードセルが見つかりませんでした。"
+                        )
+                    )
+
+            except Exception as e_ipynb:
+                logger.error(
+                    f"Jupyter Notebook '{file_name}' の処理中にエラー: {e_ipynb}",
+                    exc_info=True,
+                )
+                api_contents_list.append(
+                    Part(
+                        text=file_description_for_prompt
+                        + f"このNotebookの処理中にエラーが発生しました: {str(e_ipynb)[:100]}"
+                    )
+                )
+
+        elif mime_type.startswith("text/") or any(
+            file_name.lower().endswith(ext)
+            for ext in [
+                ".txt",
+                ".md",
+                ".py",
+                ".js",
+                ".html",
+                ".css",
+                ".json",
+                ".csv",
+                ".xml",
+                ".rtf",
+            ]
+        ):
+            # テキストベースのファイル (PDF以外)
+            decoded_text = None
+            detected_encoding = None
+            try:
+                decoded_text = file_bytes.decode("utf-8")
+                detected_encoding = "UTF-8"
+            except UnicodeDecodeError:
+                try:
+                    decoded_text = file_bytes.decode(
+                        "shift-jis"
+                    )  # 日本語環境でよく使われる
+                    detected_encoding = "Shift-JIS"
+                except UnicodeDecodeError:
+                    try:
+                        decoded_text = file_bytes.decode("cp932")  # Windowsの日本語
+                        detected_encoding = "CP932"
+                    except UnicodeDecodeError:
+                        logger.warning(
+                            f"ファイル '{file_name}' の自動エンコーディング判別に失敗しました。UTF-8で強制デコードを試みます。"
+                        )
+                        # 最終手段としてエラーを無視してデコード
+                        decoded_text = file_bytes.decode("utf-8", errors="replace")
+                        detected_encoding = "UTF-8 (forced, with replacements)"
+
+            if decoded_text is not None:
+                file_description_for_prompt += (
+                    f"エンコーディング: {detected_encoding} (推定)\n"
+                )
+                max_chars = 30000
+                if len(decoded_text) > max_chars:
+                    decoded_text = decoded_text[:max_chars]
+                    file_description_for_prompt += f"注意: ファイル内容が長いため、先頭{max_chars}文字のみ利用します。\n"
+
+                # MIMEタイプを維持しつつ、バイトデータとしてエンコードし直してPartを作成
+                # (元々テキストなら、mime_typeも text/plain などになっているはず)
+                try:
+                    file_part_to_add = Part.from_bytes(
+                        data=decoded_text.encode(
+                            detected_encoding.split(" ")[0]
+                            if detected_encoding
+                            else "utf-8"
+                        ),
+                        mime_type=mime_type
+                        if mime_type.startswith("text/")
+                        else "text/plain; charset=utf-8",
+                    )
+                    logger.info(
+                        f"テキストファイル '{file_name}' をデコードしてPartに追加しました。"
+                    )
+                    api_contents_list.append(
+                        Part(
+                            text=file_description_for_prompt
+                            + "添付されたテキストファイルの内容を考慮して回答してください。"
+                        )
+                    )
+                except Exception as e_text_part:
+                    logger.error(
+                        f"テキストファイルのPart作成中にエラー ({file_name}): {e_text_part}",
+                        exc_info=True,
+                    )
+                    api_contents_list.append(
+                        Part(
+                            text=file_description_for_prompt
+                            + f"添付ファイルの処理に失敗しました: {str(e_text_part)[:100]}"
+                        )
+                    )
+
+        elif mime_type == "application/pdf":
+            try:
+                file_part_to_add = Part.from_bytes(data=file_bytes, mime_type=mime_type)
+                logger.info(f"PDFファイル '{file_name}' をPartに追加しました。")
+                api_contents_list.append(
+                    Part(
+                        text=file_description_for_prompt
+                        + "添付されたPDFファイルの内容を考慮して回答してください。"
+                    )
+                )
+            except Exception as e_pdf_part:
+                logger.error(
+                    f"PDFファイルのPart作成中にエラー ({file_name}): {e_pdf_part}",
+                    exc_info=True,
+                )
+                api_contents_list.append(
+                    Part(
+                        text=file_description_for_prompt
+                        + f"添付PDFの処理に失敗しました: {str(e_pdf_part)[:100]}"
+                    )
+                )
+
+        else:  # その他のサポートされていない可能性のあるMIMEタイプ
+            logger.warning(
+                f"MIMEタイプ '{mime_type}' のファイル '{file_name}' は内容の直接処理をスキップします。ファイル情報のみを渡します。"
+            )
+            api_contents_list.append(
+                Part(
+                    text=file_description_for_prompt
+                    + "このファイルタイプは直接内容を解析できませんでしたが、ファイル名や種類を考慮して回答してください。"
+                )
             )
 
-    # システムプロンプトとユーザ固有プロンプトを結合
-    final_prompt = system_base_prompt + "\n".join(user_specific_prompt_parts)
+        if file_part_to_add:
+            api_contents_list.append(file_part_to_add)
 
-    # 最後に、JSON出力であることの念押し（これは03_json_output_format_prompt.mdの最後に含めても良い）
-    final_prompt += "\n\n上記全ての指示に従い、指定されたJSON形式で応答してください。"
+    for i, part_obj in enumerate(api_contents_list):
+        if hasattr(part_obj, "text") and part_obj.text:  # textが空でないことを確認
+            logger.info(
+                f"  コンテンツパート {i} (text, 抜粋): {part_obj.text[:100]}..."
+            )
+        elif hasattr(part_obj, "inline_data"):
+            logger.info(
+                f"  コンテンツパート {i} (inline_data, MIME: {part_obj.inline_data.mime_type})"
+            )
+    # --- Groundingツールの準備 ---
+    tools_list_for_api = None  # デフォルトはNone
+    use_grounding = selected_goal == "困りごとの解決"  # Groundingを使う条件
 
-    logger.info(
-        f"Geminiへ送信するプロンプト (最初の500文字):\n{final_prompt[:500]}..."
-    )  # 全体を確認するためにはここを調整
+    if use_grounding:
+        tools_list_for_api = [Tool(google_search=GoogleSearch())]
+        logger.info("Grounding (Google Search) ツールを有効化します。")
+        # Grounding使用時は構造化出力を諦めるため、プロンプトでJSON形式を強く指示
+        system_instruction_text += (
+            "\n\n# 出力形式に関する重要指示 (Grounding利用時):\n"
+            "あなたは、以下のJSON「風」の構造で応答テキストを生成してください。\n"
+            "マークダウンのコードブロック ```json ... ``` で囲む必要はありません。純粋なJSONテキストとしてください。\n"
+            "例:\n"
+            "{\n"
+            '  "explanation": "主要な解説文です。マークダウン形式になります。",\n'
+            '  "quiz": null, \n'
+            '  "references": [\n'
+            '    {"title": "信頼できる情報源1のタイトル", "url": "https://example.com/source1"},\n'
+            '    {"title": "信頼できる情報源2のタイトル", "url": "https://example.com/source2"}\n'
+            "  ]\n"
+            "}\n"
+            "参考文献のURLは、あなたがGoogle検索で見つけ、実在すると確認できたものを3つから5つ挙げてください。"
+            "explanation, referencesは必須です。quizは必ずnullとしてください。"
+        )
+    else:
+        # Groundingを使わない場合は、response_schemaによる構造化出力を期待
+        system_instruction_text += (
+            "\n\n# 出力形式に関する重要指示 (構造化出力利用時):\n"
+            "あなたは、指定されたJSONスキーマに厳密に従ったJSONオブジェクトのみを出力してください。\n"
+            "JSON以外のテキスト（説明文、前置き、後書きなど）は一切含めないでください。"
+        )
+
+    logger.info(f"システム指示 (抜粋):\n{system_instruction_text[:300]}...")
+    logger.info(f"ユーザープロンプト (抜粋):\n{user_text_prompt_parts[:300]}...")
+    logger.info(f"送信するコンテンツパートの数: {len(api_contents_list)}")
+
+    # # GenerationConfig (新しいSDKでは辞書で渡すのが主流の模様、特にresponse_schemaを含む場合)
+    # generation_config_dict = {
+    #     "response_mime_type": "application/json",
+    #     "response_schema": GeminiStructuredResponse,  # Pydanticモデルを直接指定
+    #     # "temperature": 0.7,
+    #     # "candidate_count": 1, # 必要な場合
+    # }
+
+    safety_settings_typed_for_api: List[SafetySetting] = [
+        SafetySetting(category=hc, threshold=HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE)
+        for hc in [
+            HarmCategory.HARM_CATEGORY_HARASSMENT,
+            HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+        ]
+    ]
+
+    # --- GenerationConfig オブジェクトの構築 ---
+    if use_grounding:
+        # Grounding使用時は response_schema を指定しない
+        generation_config_obj = GenerateContentConfig(
+            response_mime_type="text/plain",  # Grounding時はプレーンテキストでJSON風文字列を受け取る
+            tools=tools_list_for_api,  # Grounding toolを使用
+            system_instruction=Content(
+                parts=[Part.from_text(text=system_instruction_text)]
+            ),
+            safety_settings=safety_settings_typed_for_api,
+            candidate_count=1,
+            # temperature=0.7, # 必要に応じて
+            # max_output_tokens=8192,
+        )
+        logger.info(
+            "Grounding利用のため、response_schemaは設定せず、text/plainでJSON風テキストを期待します。"
+        )
+    else:
+        # Grounding未使用時は response_schema を指定して構造化出力を試みる
+        generation_config_obj = GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=GeminiStructuredResponse,
+            candidate_count=1,  # 通常は1で十分
+            system_instruction=Content(
+                parts=[Part.from_text(text=system_instruction_text)]
+            ),
+            safety_settings=safety_settings_typed_for_api,
+            # temperature=0.7,
+            # max_output_tokens=8192,
+        )
+        logger.info(
+            "Grounding未使用のため、response_schemaを設定し、application/jsonを期待します。"
+        )
 
     try:
-        # GenerationConfig: response_schema を削除し、response_mime_type を使用
-        generation_config = (
-            genai.types.GenerationConfig(  # ★ genai.types.GenerationConfig に修正
-                response_mime_type="application/json",
-            )
-        )
-
-        safety_settings = [
-            {"category": c, "threshold": "BLOCK_MEDIUM_AND_ABOVE"}
-            for c in [
-                "HARM_CATEGORY_HARASSMENT",
-                "HARM_CATEGORY_HATE_SPEECH",
-                "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                "HARM_CATEGORY_DANGEROUS_CONTENT",
-            ]
-        ]
         logger.info(
-            f"Gemini API ({gemini_model.model_name}) へのリクエストを開始します (JSONモード)..."
-        )  # ★ gemini_model.model_name
-
-        gemini_api_response = await gemini_model.generate_content_async(
-            final_prompt,
-            generation_config=generation_config,
-            safety_settings=safety_settings,
-            request_options={"timeout": 120},
+            f"Gemini API ({GEMINI_MODEL_NAME}) へ非同期リクエストを開始します (google-genai SDK)..."
+        )
+        gemini_api_response = await client.aio.models.generate_content(  # client.aio.models を使用
+            model=f"models/{GEMINI_MODEL_NAME}",  # "models/" プレフィックス
+            contents=api_contents_list,  # ★ ここにテキストとファイルパートのリストが入る
+            config=generation_config_obj,  # GenerateContentConfigオブジェクトを渡す
         )
 
-        # response.text をパースする
-        structured_response_obj = parse_gemini_json_response(
-            gemini_api_response.text, GeminiStructuredResponse
-        )
-        return structured_response_obj
-    except (
-        genai.types.BlockedPromptException
-    ) as e_blocked:  # ★ genai.types.BlockedPromptException
-        logger.warning(f"Gemini APIリクエストがブロックされました: {e_blocked}")
-        raise HTTPException(status_code=400, detail="BLOCKED_PROMPT")
-    except (
-        genai.types.StopCandidateException
-    ) as e_stop:  # ★ genai.types.StopCandidateException
-        logger.warning(f"Gemini APIが予期せず停止しました: {e_stop}")
-        partial_text = ""
-        if hasattr(gemini_api_response, "text") and gemini_api_response.text:
-            partial_text = gemini_api_response.text
-        elif (
-            hasattr(e_stop, "args") and e_stop.args and isinstance(e_stop.args[0], str)
+        # --- レスポンスの正常性チェックとプロンプトフィードバックの確認 ---
+        if (
+            gemini_api_response.prompt_feedback
+            and gemini_api_response.prompt_feedback.block_reason
         ):
-            partial_text = e_stop.args[0]
-        if partial_text:
-            logger.info(f"部分的なレスポンスをパース試行: {partial_text[:300]}...")
-            return parse_gemini_json_response(partial_text, GeminiStructuredResponse)
-        else:
-            raise HTTPException(status_code=500, detail="API_UNEXPECTED_STOP")
-    except asyncio.TimeoutError:
-        logger.error("Gemini APIリクエストがタイムアウトしました。")
+            block_reason_str = BlockedReason(
+                gemini_api_response.prompt_feedback.block_reason
+            ).name
+            block_message = f"BLOCKED_PROMPT: {gemini_api_response.prompt_feedback.block_reason_message or block_reason_str}"
+            logger.warning(
+                f"Gemini APIリクエストがブロックされました: {block_message} / Feedback: {gemini_api_response.prompt_feedback}"
+            )
+            raise HTTPException(status_code=400, detail=block_message)
+
+        if not (
+            gemini_api_response.candidates
+            and gemini_api_response.candidates[0].content
+            and gemini_api_response.candidates[0].content.parts
+            and gemini_api_response.candidates[0].content.parts[0].text
+        ):
+            logger.error(
+                f"Geminiからの応答構造が予期せぬ形式です: {gemini_api_response}"
+            )
+            # 候補があるが finish_reason が STOP 以外の場合も考慮
+            if (
+                gemini_api_response.candidates
+                and gemini_api_response.candidates[0].finish_reason
+            ):
+                finish_reason_str = FinishReason(
+                    gemini_api_response.candidates[0].finish_reason
+                ).name
+                if finish_reason_str != "STOP":
+                    logger.warning(
+                        f"Gemini APIが予期せず停止しました。Finish Reason: {finish_reason_str}"
+                    )
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"API_UNEXPECTED_STOP: Finish Reason - {finish_reason_str}",
+                    )
+            raise HTTPException(
+                status_code=500, detail="API_INVALID_RESPONSE_STRUCTURE"
+            )
+
+        response_text_to_parse = gemini_api_response.candidates[0].content.parts[0].text
+
+        # # レスポンス構造の確認とテキスト取得
+        # if gemini_api_response.candidates:
+        #     if (
+        #         gemini_api_response.candidates[0].content
+        #         and gemini_api_response.candidates[0].content.parts
+        #     ):
+        #         response_text_to_parse = (
+        #             gemini_api_response.candidates[0].content.parts[0].text
+        #         )
+        #     elif hasattr(
+        #         gemini_api_response.candidates[0], "text"
+        #     ):  # 古いSDKの名残かもしれないが一応
+        #         response_text_to_parse = gemini_api_response.candidates[0].text  # type: ignore
+        # elif (
+        #     hasattr(gemini_api_response, "text") and gemini_api_response.text
+        # ):  # candidatesがない場合のフォールバック
+        #     response_text_to_parse = gemini_api_response.text
+
+        # if not response_text_to_parse:
+        #     logger.error(
+        #         f"Geminiからの応答からテキストが取得できませんでした: {gemini_api_response}"
+        #     )
+        #     if (
+        #         gemini_api_response.prompt_feedback
+        #         and gemini_api_response.prompt_feedback.block_reason
+        #     ):
+        #         raise genai_errors.BlockedPromptError(
+        #             f"BLOCKED_PROMPT: {gemini_api_response.prompt_feedback.block_reason_message or gemini_api_response.prompt_feedback.block_reason}"
+        #         )
+        #     raise HTTPException(status_code=500, detail="API_EMPTY_RESPONSE_TEXT")
+
+        logger.info(f"Geminiからの生の応答テキスト: {response_text_to_parse}")
+
+        # response.parsed の利用
+        structured_response_obj: Optional[GeminiStructuredResponse] = None
+        if (
+            hasattr(gemini_api_response, "parsed")
+            and gemini_api_response.parsed is not None
+        ):
+            try:
+                # .parsed が既にPydanticモデルのインスタンスになっていることを期待
+                parsed_sdk_obj = gemini_api_response.parsed
+                if isinstance(parsed_sdk_obj, GeminiStructuredResponse):
+                    structured_response_obj = parsed_sdk_obj
+                    structured_response_obj.raw_gemini_text = (
+                        response_text_to_parse  # 生テキストも保持
+                    )
+                    logger.info(
+                        "SDKの response.parsed からPydanticモデルの取得に成功。"
+                    )
+                elif (
+                    isinstance(parsed_sdk_obj, list)
+                    and parsed_sdk_obj
+                    and isinstance(parsed_sdk_obj[0], GeminiStructuredResponse)
+                ):  # list[Recipe]のケース
+                    structured_response_obj = parsed_sdk_obj[0]  # 最初の要素を使用
+                    structured_response_obj.raw_gemini_text = response_text_to_parse
+                    logger.info(
+                        "SDKの response.parsed (リスト)からPydanticモデルの取得に成功。"
+                    )
+                else:
+                    logger.warning(
+                        f"SDKの response.parsed の型 ({type(parsed_sdk_obj)}) が期待と異なります。response_textからパースします。"
+                    )
+            except Exception as e_parsed_sdk:
+                logger.warning(
+                    f"SDKの response.parsed の処理中にエラー: {e_parsed_sdk}。response_textからパースします。"
+                )
+
+        if structured_response_obj is None:  # .parsed が使えなかった場合
+            structured_response_obj = parse_gemini_json_response(
+                response_text_to_parse, GeminiStructuredResponse
+            )
+            if (
+                structured_response_obj.explanation.startswith("エラー:")
+                and structured_response_obj.raw_gemini_text
+            ):
+                # パース失敗時はraw_gemini_textに元のテキストが入るので、それを再度セットする必要はない
+                pass
+            else:  # パース成功時はraw_gemini_textをセット
+                structured_response_obj.raw_gemini_text = response_text_to_parse
+
+        # Grounding Metadata のログ出力
+        if (
+            tools_list_for_api
+            and gemini_api_response.candidates
+            and gemini_api_response.candidates[0].grounding_metadata
+        ):
+            logger.info(
+                f"Grounding Metadata: {gemini_api_response.candidates[0].grounding_metadata}"
+            )
+            if gemini_api_response.candidates[0].grounding_metadata.search_entry_point:
+                logger.info(
+                    f"  Search Entry Point Rendered Content (抜粋): {gemini_api_response.candidates[0].grounding_metadata.search_entry_point.rendered_content[:200]}..."
+                )
+        return structured_response_obj
+
+    # --- 新しいエラーハンドリング階層 ---
+    except (
+        genai_errors.ClientError
+    ) as e_client:  # google.genai.errors.ClientError (4xx系)
+        # ClientError は APIError を継承しているので、APIError より先に補足
+        logger.warning(
+            f"Gemini API ClientError: Code={e_client.code}, Status={e_client.status}, Message={e_client.message}",
+            exc_info=True,
+        )
+        # e_client.details に詳細なJSONが含まれる場合がある
+        error_detail = (
+            f"CLIENT_ERROR (Code: {e_client.code}): {e_client.message or str(e_client)}"
+        )
+        # プロンプトブロックは prompt_feedback で検知するが、APIレベルの400エラーもここで補足される
+        status_code = e_client.code if 400 <= e_client.code < 500 else 400
+        raise HTTPException(
+            status_code=status_code, detail=error_detail[:200]
+        )  # メッセージが長すぎないように
+
+    except (
+        genai_errors.APIError
+    ) as e_sdk_api:  # google.genai.errors.APIError (より汎用的)
+        logger.error(
+            f"Gemini APIError: Code={e_sdk_api.code}, Status={e_sdk_api.status}, Message={e_sdk_api.message}",
+            exc_info=True,
+        )
+        error_detail = (
+            f"API_ERROR (Code: {e_sdk_api.code}): {e_sdk_api.message or str(e_sdk_api)}"
+        )
+        status_code = e_sdk_api.code if e_sdk_api.code else 500
+        raise HTTPException(status_code=status_code, detail=error_detail[:200])
+
+    except google.api_core.exceptions.GoogleAPIError as e_google_api:
+        # これは、認証失敗、リソース上限超過、サービス利用不可など、より広範なGoogle Cloud APIエラーを補足
+        logger.error(f"Google API Core Error: {e_google_api}", exc_info=True)
+        # e_google_api.code() (gRPCステータスコードの場合) や e_google_api.message で詳細を取得
+        status_code_grpc = e_google_api.code() if callable(e_google_api.code) else None
+        error_detail = f"GOOGLE_API_CORE_ERROR (gRPC Code: {status_code_grpc}): {str(e_google_api)}"
+        http_status_code = 500  # デフォルト
+        if isinstance(e_google_api, google.api_core.exceptions.PermissionDenied):
+            http_status_code = 403
+        elif isinstance(e_google_api, google.api_core.exceptions.InvalidArgument):
+            http_status_code = 400
+        elif isinstance(e_google_api, google.api_core.exceptions.DeadlineExceeded):
+            http_status_code = 504
+        elif isinstance(e_google_api, google.api_core.exceptions.ServiceUnavailable):
+            http_status_code = 503
+        raise HTTPException(status_code=http_status_code, detail=error_detail[:200])
+
+    except asyncio.TimeoutError:  # request_options の timeout
+        logger.error("Gemini APIリクエストがタイムアウトしました。", exc_info=True)
         raise HTTPException(status_code=504, detail="API_TIMEOUT")
-    except Exception as e_api:
+
+    except Exception as e_api:  # その他の予期せぬエラー
         logger.error(
             f"Gemini API呼び出しまたはレスポンス処理中に予期せぬエラー: {e_api}",
             exc_info=True,
         )
-        raise HTTPException(status_code=500, detail="INTERNAL_SERVER_ERROR")
+        raise HTTPException(
+            status_code=500, detail=f"INTERNAL_SERVER_ERROR: {str(e_api)[:100]}"
+        )
 
 
-# --- クイズ採点エンドポイント (プロンプト生成部分を修正) ---
 @app.post("/api/evaluate-quiz", response_model=QuizEvaluationResponse)
 async def evaluate_quiz_answer(request_data: QuizEvaluationRequest, request: Request):
-    app_instance = request.app
-    if not (
-        hasattr(app_instance.state, "is_gemini_initialized")
-        and app_instance.state.is_gemini_initialized
-        and hasattr(app_instance.state, "gemini_model")
-        and app_instance.state.gemini_model is not None
-    ):
-        if (
-            hasattr(app_instance.state, "gemini_init_task")
-            and app_instance.state.gemini_init_task
-            and not app_instance.state.gemini_init_task.done()
-        ):
-            raise HTTPException(status_code=503, detail="GEMINI_INITIALIZING")
-        raise HTTPException(status_code=503, detail="GEMINI_UNAVAILABLE")
+    client: genai.Client = request.app.state.gemini_client
+    if not client or not request.app.state.is_gemini_initialized:
+        raise HTTPException(status_code=503, detail="GEMINI_UNAVAILABLE_FOR_EVALUATION")
 
-    gemini_model = app_instance.state.gemini_model
-
-    # 採点用のシステムプロンプトを読み込む (動的情報あり)
-    evaluation_system_base_prompt = load_prompt_files(
+    evaluation_system_instruction_text = load_prompt_files(
         EVALUATION_PROMPT_FILENAME, add_dynamic_info=True
     )
-    if evaluation_system_base_prompt.startswith(
-        "エラー:"
-    ):  # 読み込み失敗時の簡易エラーハンドリング
+    if evaluation_system_instruction_text.startswith("エラー:"):
         raise HTTPException(status_code=500, detail="EVALUATION_PROMPT_LOAD_ERROR")
+    user_query_for_evaluation = f"\n# 元の解説とクイズ:\n## 解説:\n{request_data.original_explanation}\n\n## クイズの質問:\n{request_data.quiz_question}\n\n# ユーザーの解答:\n{request_data.user_answer}\n\n# あなたからのフィードバック (マークダウン形式):"
 
-    user_query_for_evaluation = f"""
-# 元の解説とクイズ:
-## 解説:
-{request_data.original_explanation}
-
-## クイズの質問:
-{request_data.quiz_question}
-
-# ユーザーの解答:
-{request_data.user_answer}
-
-# あなたからのフィードバック (マークダウン形式):
-"""
-    final_evaluation_prompt = evaluation_system_base_prompt + user_query_for_evaluation
     logger.info(
-        f"Geminiへ送信する採点プロンプト (最初の500文字):\n{final_evaluation_prompt[:500]}..."
+        f"システム指示 (採点用抜粋):\n{evaluation_system_instruction_text[:300]}..."
+    )
+    logger.info(
+        f"ユーザープロンプト (採点用抜粋):\n{user_query_for_evaluation[:300]}..."
+    )
+
+    safety_settings_typed_for_api: List[SafetySetting] = [
+        SafetySetting(category=hc, threshold=HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE)
+        for hc in [
+            HarmCategory.HARM_CATEGORY_HARASSMENT,
+            HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+        ]
+    ]
+
+    evaluation_generation_config = GenerateContentConfig(
+        temperature=0.3,  # 採点なので低めを推奨
+        safety_settings=safety_settings_typed_for_api,
     )
 
     try:
-        evaluation_generation_config = (
-            genai.types.GenerationConfig()
-        )  # ★ genai.types.GenerationConfig
-
         logger.info(
-            f"Gemini ({gemini_model.model_name}) へクイズ採点リクエストを開始します..."
-        )  # ★ gemini_model.model_name
-        evaluation_response = await gemini_model.generate_content_async(
-            final_evaluation_prompt,
-            generation_config=evaluation_generation_config,
+            f"Gemini ({GEMINI_MODEL_NAME}) へクイズ採点リクエストを開始します..."
         )
-        # ... (以降の採点エンドポイントの処理は変更なし) ...
-        evaluation_comment_text = evaluation_response.text
-        logger.info(f"Geminiからの採点結果: {evaluation_comment_text[:200]}...")
-
-        return QuizEvaluationResponse(evaluation_comment=evaluation_comment_text)
-
-    except (
-        genai.types.BlockedPromptException
-    ) as e_blocked:  # ★ genai.types.BlockedPromptException
-        logger.warning(f"Gemini API採点リクエストがブロックされました: {e_blocked}")
-        raise HTTPException(status_code=400, detail="BLOCKED_PROMPT_EVALUATION")
-    except (
-        genai.types.StopCandidateException
-    ) as e_stop:  # ★ genai.types.StopCandidateException
-        logger.warning(f"Gemini API採点が予期せず停止しました: {e_stop}")
-        partial_text = (
-            evaluation_response.text
-            if hasattr(evaluation_response, "text") and evaluation_response.text
-            else ""
+        evaluation_response = await client.aio.models.generate_content(
+            model=f"models/{GEMINI_MODEL_NAME}",
+            contents=[user_query_for_evaluation],
+            config=evaluation_generation_config,  # オブジェクトで渡す
         )
-        if partial_text:
-            return QuizEvaluationResponse(
-                evaluation_comment=f"採点が途中で終了しました: {partial_text}"
+
+        # --- レスポンスの正常性チェックとプロンプトフィードバックの確認 ---
+        if (
+            evaluation_response.prompt_feedback
+            and evaluation_response.prompt_feedback.block_reason
+        ):
+            block_reason_str = BlockedReason(
+                evaluation_response.prompt_feedback.block_reason
+            ).name
+            block_message = f"BLOCKED_PROMPT: {evaluation_response.prompt_feedback.block_reason_message or block_reason_str}"
+            logger.warning(
+                f"Gemini APIリクエストがブロックされました: {block_message} / Feedback: {evaluation_response.prompt_feedback}"
             )
-        else:
+            raise HTTPException(status_code=400, detail=block_message)
+
+        if not (
+            evaluation_response.candidates
+            and evaluation_response.candidates[0].content
+            and evaluation_response.candidates[0].content.parts
+            and evaluation_response.candidates[0].content.parts[0].text
+        ):
+            logger.error(
+                f"Geminiからの応答構造が予期せぬ形式です: {evaluation_response}"
+            )
+            # 候補があるが finish_reason が STOP 以外の場合も考慮
+            if (
+                evaluation_response.candidates
+                and evaluation_response.candidates[0].finish_reason
+            ):
+                finish_reason_str = FinishReason(
+                    evaluation_response.candidates[0].finish_reason
+                ).name
+                if finish_reason_str != "STOP":
+                    logger.warning(
+                        f"Gemini APIが予期せず停止しました。Finish Reason: {finish_reason_str}"
+                    )
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"API_UNEXPECTED_STOP: Finish Reason - {finish_reason_str}",
+                    )
             raise HTTPException(
-                status_code=500, detail="API_UNEXPECTED_STOP_EVALUATION"
+                status_code=500, detail="API_INVALID_RESPONSE_STRUCTURE"
             )
-    except asyncio.TimeoutError:
-        logger.error("Gemini API採点リクエストがタイムアウトしました。")
-        raise HTTPException(status_code=504, detail="API_TIMEOUT_EVALUATION")
-    except Exception as e_api:
-        logger.error(
-            f"Gemini API採点呼び出し中に予期せぬエラー: {e_api}", exc_info=True
+
+        response_text_to_parse_eval = (
+            evaluation_response.candidates[0].content.parts[0].text
         )
-        raise HTTPException(status_code=500, detail="INTERNAL_SERVER_ERROR_EVALUATION")
+
+        # response_text_to_parse_eval = ""
+        # if (
+        #     evaluation_response.candidates
+        #     and evaluation_response.candidates[0].content
+        #     and evaluation_response.candidates[0].content.parts
+        # ):
+        #     response_text_to_parse_eval = (
+        #         evaluation_response.candidates[0].content.parts[0].text
+        #     )
+        # elif (
+        #     hasattr(evaluation_response, "text") and evaluation_response.text
+        # ):  # フォールバック
+        #     response_text_to_parse_eval = evaluation_response.text
+
+        # if not response_text_to_parse_eval:
+        #     logger.error(
+        #         f"Geminiからの採点応答からテキストが取得できませんでした: {evaluation_response}"
+        #     )
+        #     if (
+        #         evaluation_response.prompt_feedback
+        #         and evaluation_response.prompt_feedback.block_reason
+        #     ):
+        #         raise genai_errors.BlockedPromptError(
+        #             f"BLOCKED_PROMPT_EVALUATION: {evaluation_response.prompt_feedback.block_reason_message or evaluation_response.prompt_feedback.block_reason}"
+        #         )
+        #     raise HTTPException(
+        #         status_code=500, detail="EVALUATION_EMPTY_RESPONSE_TEXT"
+        #     )
+
+        logger.info(f"Geminiからの採点結果: {response_text_to_parse_eval[:200]}...")
+        return QuizEvaluationResponse(evaluation_comment=response_text_to_parse_eval)
+
+    except (
+        genai_errors.ClientError
+    ) as e_client:  # google.genai.errors.ClientError (4xx系)
+        # ClientError は APIError を継承しているので、APIError より先に補足
+        logger.warning(
+            f"Gemini API ClientError: Code={e_client.code}, Status={e_client.status}, Message={e_client.message}",
+            exc_info=True,
+        )
+        # e_client.details に詳細なJSONが含まれる場合がある
+        error_detail = (
+            f"CLIENT_ERROR (Code: {e_client.code}): {e_client.message or str(e_client)}"
+        )
+        # プロンプトブロックは prompt_feedback で検知するが、APIレベルの400エラーもここで補足される
+        status_code = e_client.code if 400 <= e_client.code < 500 else 400
+        raise HTTPException(
+            status_code=status_code, detail=error_detail[:200]
+        )  # メッセージが長すぎないように
+
+    except (
+        genai_errors.APIError
+    ) as e_sdk_api:  # google.genai.errors.APIError (より汎用的)
+        logger.error(
+            f"Gemini APIError: Code={e_sdk_api.code}, Status={e_sdk_api.status}, Message={e_sdk_api.message}",
+            exc_info=True,
+        )
+        error_detail = (
+            f"API_ERROR (Code: {e_sdk_api.code}): {e_sdk_api.message or str(e_sdk_api)}"
+        )
+        status_code = e_sdk_api.code if e_sdk_api.code else 500
+        raise HTTPException(status_code=status_code, detail=error_detail[:200])
+
+    except google.api_core.exceptions.GoogleAPIError as e_google_api:
+        # これは、認証失敗、リソース上限超過、サービス利用不可など、より広範なGoogle Cloud APIエラーを補足
+        logger.error(f"Google API Core Error: {e_google_api}", exc_info=True)
+        # e_google_api.code() (gRPCステータスコードの場合) や e_google_api.message で詳細を取得
+        status_code_grpc = e_google_api.code() if callable(e_google_api.code) else None
+        error_detail = f"GOOGLE_API_CORE_ERROR (gRPC Code: {status_code_grpc}): {str(e_google_api)}"
+        http_status_code = 500  # デフォルト
+        if isinstance(e_google_api, google.api_core.exceptions.PermissionDenied):
+            http_status_code = 403
+        elif isinstance(e_google_api, google.api_core.exceptions.InvalidArgument):
+            http_status_code = 400
+        elif isinstance(e_google_api, google.api_core.exceptions.DeadlineExceeded):
+            http_status_code = 504
+        elif isinstance(e_google_api, google.api_core.exceptions.ServiceUnavailable):
+            http_status_code = 503
+        raise HTTPException(status_code=http_status_code, detail=error_detail[:200])
+
+    except asyncio.TimeoutError:  # request_options の timeout
+        logger.error("Gemini APIリクエストがタイムアウトしました。", exc_info=True)
+        raise HTTPException(status_code=504, detail="API_TIMEOUT")
+
+    except Exception as e_api:  # その他の予期せぬエラー
+        logger.error(
+            f"Gemini API呼び出しまたはレスポンス処理中に予期せぬエラー: {e_api}",
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500, detail=f"INTERNAL_SERVER_ERROR: {str(e_api)[:100]}"
+        )
+
+    # except genai_errors.BlockedPromptError as e_blocked:
+    #     logger.warning(
+    #         f"Gemini API採点リクエストがブロックされました: {e_blocked}", exc_info=True
+    #     )
+    #     raise HTTPException(
+    #         status_code=400, detail=f"BLOCKED_PROMPT_EVALUATION: {str(e_blocked)}"
+    #     )
+    # except google.api_core.exceptions.GoogleAPIError as e_google_api:
+    #     logger.error(
+    #         f"Google APIエラーが発生しました (採点時): {e_google_api}", exc_info=True
+    #     )
+    #     raise HTTPException(
+    #         status_code=500,
+    #         detail=f"GOOGLE_API_ERROR_EVALUATION: {str(e_google_api)[:100]}",
+    #     )
+    # except asyncio.TimeoutError:
+    #     logger.error("Gemini API採点リクエストがタイムアウトしました。", exc_info=True)
+    #     raise HTTPException(status_code=504, detail="EVALUATION_API_TIMEOUT")
+    # except Exception as e_api_eval:
+    #     logger.error(
+    #         f"Gemini API採点呼び出し中に予期せぬエラー: {e_api_eval}", exc_info=True
+    #     )
+    #     raise HTTPException(
+    #         status_code=500,
+    #         detail=f"INTERNAL_SERVER_ERROR_EVALUATION: {str(e_api_eval)[:100]}",
+    #     )
